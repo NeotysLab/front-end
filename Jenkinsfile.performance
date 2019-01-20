@@ -6,11 +6,31 @@ pipeline {
   }
   environment {
     APP_NAME = "front-end"
+    DYNATRACEID="${env.DT_ACCOUNTID}"
+    DYNATRACEAPIKEY="${env.DT_API_TOKEN}"
+    NLAPIKEY="${env.NL_WEB_API_KEY}"
+    NL_DT_TAG="app:${env.APP_NAME},environment:dev"
+    OUTPUTSANITYCHECK="$WORKSPACE/infrastructure/sanitycheck.json"
+    NEOLOAD_ASCODEFILE="$WORKSPACE/test/neoload/Frontend_neoload.yaml"
+    NEOLOAD_ANOMALIEDETECTIONFILE="$WORKSPACE/monspec/frontend_anomalieDection.json"
+    BASICCHECKURI="health"
+    GITORIGIN="neotyslab"
   }
   stages {
+  stage('Start NeoLoad infrastructure') {
+
+        steps {
+                checkout scm
+                container('kubectl') {
+                    script {
+                     sh "kubectl create -f $WORKSPACE/infrastructure/infrastructure/neoload/lg/docker-compose.yml"
+                    }
+                }
+        }
+
+      }
     stage('Performance Check') {
       steps {
-        checkout scm
 
         recordDynatraceSession(
           envId: 'Dynatrace Tenant',
@@ -28,20 +48,22 @@ pipeline {
           ]
         ) 
         {
-          container('jmeter') {
+          container('neoload') {
+            sh "sed -i 's/CHECK_TO_REPLACE/${BASICCHECKURI}/'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's/HOST_TO_REPLACE/${env.APP_NAME}.dev.svc/'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's/PORT_TO_REPLACE/80/'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's/DTID_TO_REPLACE/${DYNATRACEID}/'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's/APIKEY_TO_REPLACE/${DYNATRACEAPIKEY}/'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's,JSONFILE_TO_REPLACE,${NEOLOAD_ANOMALIEDETECTIONFILE},'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's/TAGS_TO_REPLACE/${NL_DT_TAG}/'  ${NEOLOAD_ASCODEFILE}"
+            sh "sed -i 's,OUTPUTFILE_TO_REPLACE,${OUTPUTSANITYCHECK},'  ${NEOLOAD_ASCODEFILE}"
             script {
-              def status = executeJMeter ( 
-                scriptName: "jmeter/${env.APP_NAME}_load.jmx",
-                resultsDir: "PerfCheck_${env.APP_NAME}",
-                serverUrl: "${env.APP_NAME}.dev", 
-                serverPort: 80,
-                checkPath: '/health',
-                vuCount: 10,
-                loopCount: 250,
-                LTN: "PerfCheck_${BUILD_NUMBER}",
-                funcValidation: false,
-                avgRtValidation: 250
-              )
+              sh "mkdir -p /home/jenkins/.neotys/neoload"
+              sh "cp $WORKSPACE/infrastructure/infrastructure/neoload/license.lic /home/jenkins/.neotys/neoload/"
+
+              status =sh(script:"/neoload/bin/NeoLoadCmd -project $WORKSPACE/test/neoload/load_template/load_template.nlp ${NEOLOAD_ASCODEFILE} -testResultName PerfCheck_frontend_${BUILD_NUMBER} -description PerfCheck_frontend_${BUILD_NUMBER} -nlweb -L FrontEndLoad=$WORKSPACE/infrastructure/infrastructure/neoload/lg/remote.txt -L Population_Dynatrace_Integration=$WORKSPACE/infrastructure/infrastructure/neoload/lg/local.txt -nlwebToken $NLAPIKEY -launch FrontEndLoad -noGUI", returnStatus: true)
+
+
               if (status != 0) {
                 currentBuild.result = 'FAILED'
                 error "Performance check failed."
@@ -57,5 +79,17 @@ pipeline {
         ) 
       }
     }
+  }
+  post {
+      always {
+        container('kubectl') {
+               script {
+                echo "delete neoload infrastructure"
+                sh "kubectl delete svc nl-lg-front -n cicd"
+                sh "kubectl delete pod nl-lg-front -n cicd --grace-period=0 --force"
+               }
+        }
+      }
+
   }
 }
